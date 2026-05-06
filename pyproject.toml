@@ -1,0 +1,32 @@
+[project]
+name = "nanogpt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { email = "ashishasthana6@gmail.com" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy==2.4.4",
+    "rich==15.0.0",
+    "tiktoken>=0.12.0,<0.13.0",
+    "torch>=2.11.0,<2.12.0",
+    "tqdm==4.67.3",
+]
+
+[project.scripts]
+nanogpt = "nanogpt:main"
+
+[build-system]
+requires = ["uv_build>=0.9.0,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy==1.20.2",
+    "pre-commit==4.6.0",
+    "ruff==0.15.12",
+    "ruff-format==0.5.2",
+    "types-tqdm==4.67.3.20260408",
+]

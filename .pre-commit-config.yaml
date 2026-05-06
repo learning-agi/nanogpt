@@ -1,0 +1,29 @@
+fail_fast: false
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-format
+        name: Ruff autoformat
+        entry: uv run --frozen ruff format src
+        language: system
+        pass_filenames: false
+        types: [python]
+        args: []
+      
+      - id: ruff-check
+        name: Ruff check
+        entry: uv run --frozen ruff check src
+        language: system
+        pass_filenames: false
+        types: [python]
+        args: []
+
+      - id: mypy
+        name: Mypy type check
+        entry: uv run --frozen mypy src
+        language: python
+        pass_filenames: false
+        types:
+          - file
+          - python
+        args: ["--scripts-are-modules"]
