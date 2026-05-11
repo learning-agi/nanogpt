@@ -39,3 +39,11 @@ class DataLoader:
         y = buffer[1:].view(self.batch_size, self.block_size) # Target tokens
         self.idx += 1
         return x, y
+
+    def next_batch(self) -> tuple[Tensor, Tensor]:
+        """Get the next batch of data for training."""
+        try:
+            return next(self)
+        except StopIteration:
+            self.idx = 0 # Reset index for next epoch
+            return next(self)

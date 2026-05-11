@@ -71,10 +71,14 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, H, E).transpose(1, 2)  # (B, H, T, E)
         v = v.view(B, T, H, E).transpose(1, 2)  # (B, H, T, E)
 
-        att: Tensor = q @ k.transpose(-2, -1) * (E**-0.5)  # att shape: (B, H, T, T)
-        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))  # type: ignore[index]
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, H, T, E)
+        # att: Tensor = q @ k.transpose(-2, -1) * (E**-0.5)  # att shape: (B, H, T, T)
+        # att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))  # type: ignore[index]
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, H, T, E)
+        # The above is the standard attention implementation, but it can be optimized using flash attention, which avoids materializing the full attention matrix in memory.
+        # Flash attention implementation:
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (B, H, T, E)
+
         y = y.transpose(1, 2).contiguous().view(B, T, D)  # (B, T, D)
         y = self.c_proj(y)  # (B, T, D)
         return y

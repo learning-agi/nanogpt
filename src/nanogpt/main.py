@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from rich import print
 import time
@@ -29,6 +30,7 @@ class TrainingRun:
         self.init_data_loader()
         self.init_model()
         self.init_optimizer()
+        self.grad_accumulation_setup()
 
     def setup_device(self) -> None:
         """Setup CUDA device for training."""
@@ -55,6 +57,7 @@ class TrainingRun:
             block_size=self.gpt_config.block_size,
             batch_size=self.training_config.batch_size,
         )
+        self.max_steps = len(self.data_loader)
 
     def init_model(self) -> None:
         """Initialize the GPT model for training."""
@@ -66,48 +69,104 @@ class TrainingRun:
             f"[bold blue]Model initialized with {sum(p.numel() for p in self.model.parameters())} parameters[/bold blue]"
         )
 
+    def configure_optimizers(self) -> None:
+        param_dict = {name: param for name, param in self.model.named_parameters() if param.requires_grad}
+        # Create optimizer groups, any parameter that is 2D will be weight decayed
+        # TODO: understand why we do not weight decay 1D parameters like biases and layer norms. Is it because they are less likely to overfit? Or is it just a convention that has been found to work well in practice?
+        decay_params = [param for name, param in param_dict.items() if param.dim() >= 2]
+        no_decay_params = [param for name, param in param_dict.items() if param.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": self.training_config.adam_weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+        print(f"Optimizer groups: {len(decay_params)} decay params tensors, with {num_decay_params} parameters | {len(no_decay_params)} no decay params tensors, with {num_no_decay_params} parameters")
+        fused_available = "cuda" in self.device
+        print(f"Using fused Adam optimizer: {fused_available}")
+        self.optimizer = torch.optim.AdamW(
+            optim_groups,
+            lr=self.training_config.learning_rate,
+            betas=self.training_config.adam_betas,
+            eps=self.training_config.adam_eps,
+            fused=fused_available,  # Use fused Adam for faster optimization on supported GPUs
+        )
+
     def init_optimizer(self) -> None:
         """Initialize the optimizer for training."""
         print("Initializing optimizer...")
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(), lr=self.training_config.learning_rate
-        )
+        self.configure_optimizers()
+
+    def lr_scheduler(self, step: int) -> float:
+        """Calculate learning rate with linear warmup and cosine decay."""
+        if step < self.training_config.warmup_steps:
+            return self.training_config.learning_rate * (step + 1) / self.training_config.warmup_steps
+        
+        cosine_decay_ratio = (step - self.training_config.warmup_steps) / (self.max_steps - self.training_config.warmup_steps)
+        assert 0 <= cosine_decay_ratio <= 1, f"Cosine decay ratio should be between 0 and 1, got {cosine_decay_ratio:.4f}"
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * cosine_decay_ratio))  # TODO: Understand this formula better
+        decayed_lr = (self.training_config.learning_rate - self.training_config.min_learning_rate) * cosine_decay + self.training_config.min_learning_rate
+        return decayed_lr
+
+    def grad_accumulation_setup(self) -> None:
+        B, T = self.training_config.batch_size, self.gpt_config.block_size
+        assert self.training_config.desired_batch_size % (B * T) == 0, "Desired batch size must be a multiple of the actual batch size for gradient accumulation to work properly."
+        self.grad_accumulation_steps = self.training_config.desired_batch_size // (B * T)
+        print(f"Using gradient accumulation with {self.grad_accumulation_steps} steps to achieve effective batch size of {self.training_config.desired_batch_size} tokens")
 
     def train(self) -> None:
         """Main training loop."""
         print("Starting training loop...")
         losses = []
-        print(f"Training for {len(self.data_loader)} steps...")
+        print(f"Training for {self.max_steps} steps...")
         start = time.time()
         tps_list = []
-        with tqdm.tqdm(total=len(self.data_loader), desc="Training") as pbar:
-            for step, (x, y) in enumerate(self.data_loader):
+        with tqdm.tqdm(total=self.max_steps, desc="Training") as pbar:
+            for step in range(self.max_steps):
                 t0 = time.time()
-                x, y = x.to(self.device), y.to(self.device)
                 self.optimizer.zero_grad()
-                with torch.amp.autocast(device_type=self.device, dtype=torch.bfloat16): # Use mixed precision for faster training and reduced memory usage
-                    logits, loss = self.model(x, targets=y)                
-                loss.backward()
+                # TODO: Why does grad norm increase with gradient accumulation?
+                loss_accum = 0.0
+                for micro_step in range(self.grad_accumulation_steps):
+                    x, y = self.data_loader.next_batch() # Get the next batch of data for training
+                    x, y = x.to(self.device), y.to(self.device)
+                    with torch.amp.autocast(device_type=self.device, dtype=torch.bfloat16): # Use mixed precision for faster training and reduced memory usage
+                        logits, loss = self.model(x, targets=y)    
+                    loss = loss / self.grad_accumulation_steps # Scale the loss by the number of gradient accumulation steps to get the correct gradient magnitude (equivalent to doing mean in MSE loss)            
+                    loss_accum += loss.detach()  # Detach single micro batch loss tensor from the computation graph and accumulate it for logging purposes, so we can log the average loss over the gradient accumulation steps without affecting the gradients
+                    # TODO: Doesnt detaching the loss here cause any issues with backpropagation? We still want to backpropagate through the loss to update the model parameters, but we also want to accumulate the loss for logging purposes.
+                    # By detaching the loss, we can accumulate it without affecting the gradients, which should be fine as long as we are still backpropagating through the original loss tensor that is not detached.
+                    loss.backward()
+                # Do gradient norm clipping to prevent exploding gradients, which can be more likely with mixed precision training or just bad data batch
+                # grad_norm = sum(p.grad.data.item() ** 2 for p in self.model.parameters()) ** (1. / 2) - TODO: check if this is correct way to compute grad norm
+                # Make sure this grad_norm is not too large, otherwise it can cause instability in training. We can clip the gradients to a maximum norm value to prevent this.
+                # TODO: How does clipping grad norm affect grads themselves?
+                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.training_config.grad_clip)
                 losses.append(loss.item())
+                # Set learning rate with linear warmup and cosine decay
+                lr = self.lr_scheduler(step)
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = lr
+                
                 self.optimizer.step()
                 torch.cuda.synchronize() # Ensure all GPU operations are complete before measuring time
                 t1 = time.time()
                 dt = (t1 - t0) * 1000 # Convert to milliseconds
-                tokens_per_second = self.training_config.batch_size * self.gpt_config.block_size / (t1 - t0)
+                tokens_per_second = self.training_config.batch_size * self.gpt_config.block_size * self.grad_accumulation_steps / (t1 - t0)
                 tps_list.append(tokens_per_second)
                 pbar.update(1)
                 pbar.set_postfix(loss=loss.item())
-                pbar.set_description(f"Step {step}, Time {dt:.2f} ms, TPS {tokens_per_second:.2f}")
+                pbar.set_description(f"Step {step} | Time {dt:.2f} ms | TPS {tokens_per_second:.2f} | Loss: {loss_accum.item():.4f} | Grad Norm: {norm:.4f} | LR: {lr:.2e}")
         end = time.time()
         print(f"[bold green]Final loss after training: {losses[-1]:.4f}[/bold green]")
         print(f"[bold green]Training time: {end - start:.2f} seconds[/bold green]")
         print(f"[bold green]Average time per step: {(end - start) / len(self.data_loader) * 1000:.2f} ms[/bold green]")
-        print(f"[bold green]Total tokens processed: {len(self.data_loader) * self.training_config.batch_size * self.gpt_config.block_size}[/bold green]")
+        print(f"[bold green]Total tokens processed: {self.max_steps * self.training_config.batch_size * self.gpt_config.block_size * self.grad_accumulation_steps}[/bold green]")
         print(f"[bold green]Average Throughput (Tokens per second): {np.mean(tps_list):.2f}[/bold green]")
 
 
 if __name__ == "__main__":
-    gpt_config = GPTConfig()
+    gpt_config = GPTConfig(vocab_size=50_304)
     training_config = TrainingConfig()
     parallelism_config = ParallelismConfig(is_deterministic=True)
     training_run = TrainingRun(gpt_config, training_config, parallelism_config)
@@ -164,3 +223,23 @@ if __name__ == "__main__":
 # HBM <---> GPU <---> CPU <---> RAM
 # For each complex operation, we constantly need to launch kernels, i.e., move data from HBM to GPU (slow), do computation in GPU chips (fast), then store results back to HBM (slow). This is a bottleneck because of the latency of GPU read/writes.
 # To solve this, one idea is to do operator fusion, which combines multiple operations into a single kernel, so we can do more computation in GPU chips without needing to read/write to HBM as often. This can significantly reduce the latency and improve performance.
+
+
+# 3. Flash Attention - Read flash attention paper and NVIDIA GPU architecture whitepaper
+# There are some optimizations that torch.compile cannot do, such as optimizing the attention mechanism in GPT (requires a rewrite of attention algo).
+# # Flash Attention is a technique that can optimize the attention mechanism for faster training and reduced memory usage.
+# Flash Attention is a kernel fusion operation that combines multiple attention operations into a single kernel, reducing the number of memory accesses and improving performance.
+# PyTorch: MatMul -> Mask -> Softmax -> Dropout -> MatMul
+# Flash Attention: Fused Kernel that does all of the above in one go, reducing memory accesses and improving performance.
+# Flash Attention does more FLOPs than the standard attention implementation, but it is much faster because it reduces the number of memory accesses, which are the bottleneck for performance in attention mechanisms.
+# The trick is to never materialize the full attention matrix in memory (NxN), which can be huge for large sequence lengths.
+# Instead, it computes the attention in a way that only requires storing a small portion of the attention matrix at a time, which significantly reduces memory usage and allows for much faster computation.
+# It does so by using an online softmax trick. Update softmax using the max and sum of the current block of attention scores, which allows it to compute the softmax without needing to store the entire attention matrix in memory.
+
+
+# 4. Ugly numbers removal
+# Using numbers with lots of powers of 2 can improve performance on GPUs due to better memory alignment and more efficient use of GPU resources. 
+# This is because GPUs are optimized for processing data in blocks that are powers of 2, so using batch sizes and sequence lengths that are powers of 2 can lead to better performance.
+# E.g. increase vocab to 50,304 (instead of 50,207) to make it a multiple of 256, which is a common block size for GPU processing. This can help to improve the efficiency of the model and speed up training.
+# Even though we are doing more (& redundant) computation & waste additional memory with a larger vocab size, the overall training time can still be reduced due to better GPU utilization and faster processing of the data.
+# This is a common trade-off in deep learning where we may do more computation but achieve faster training times due to better hardware utilization.
