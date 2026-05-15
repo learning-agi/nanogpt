@@ -7,15 +7,17 @@ class DataLoader:
     """
     DataLoader for loading and batching text data for training the GPT model.
     """
-    def __init__(self, data: str, block_size: int, batch_size: int) -> None:
+    def __init__(self, data: str, block_size: int, batch_size: int, process_rank: int, num_processes: int) -> None:
         self.data = data
+        self.process_rank = process_rank
+        self.num_processes = num_processes
         self.block_size = block_size
         self.batch_size = batch_size
         self.tokenizer = tiktoken.get_encoding("gpt2")
         self.vocab_size = self.tokenizer.n_vocab
         self.encoded_data = self.tokenizer.encode(self.data)
-        self.idx = 0 # Pointer to current position in the encoded data
-        self.window_size = block_size * batch_size # Total number of tokens in one window of data for a batch
+        self.idx = self.block_size * self.batch_size * self.process_rank  # Pointer to current position in the encoded data
+        self.window_size = block_size * batch_size * self.num_processes  # Total number of tokens in one window of data for a batch
 
     def __len__(self) -> int:
         # Total number of tokens in the encoded data
@@ -32,7 +34,7 @@ class DataLoader:
         buffer = torch.tensor(
             self.encoded_data[
                 self.idx * self.window_size
-                : (self.idx + 1) * self.window_size + 1
+                : (self.idx * self.window_size) + (self.batch_size * self.block_size) + 1
             ]
         )
         x = buffer[:-1].view(self.batch_size, self.block_size) # Input tokens

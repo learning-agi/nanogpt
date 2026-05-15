@@ -1,9 +1,13 @@
 import math
 import numpy as np
+import os
 from rich import print
 import time
 import torch
 import tqdm
+
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from nanogpt.config.gpt import GPTConfig
 from nanogpt.config.parallelism import ParallelismConfig
@@ -25,19 +29,42 @@ class TrainingRun:
         self.gpt_config = gpt_config
         self.training_config = training_config
         self.parallelism_config = parallelism_config
-        self.setup_device()
+        self.setup_ddp()
+        # self.setup_device()
+        self.grad_accumulation_setup()
         self.stats_before_training()
         self.init_data_loader()
         self.init_model()
         self.init_optimizer()
-        self.grad_accumulation_setup()
 
     def setup_device(self) -> None:
         """Setup CUDA device for training."""
         self.device = "cpu"
         if torch.cuda.is_available():
             self.device = "cuda"
-        print(f"Using device: {self.device}")
+        print(f"Using device: {sslf.device}")
+
+    def setup_ddp(self) -> None:
+        # Using ``torchrun`` env vars for detection
+        self.ddp = int(os.environ.get("RANK", -1)) != -1  # Is this a DDP run?
+        if self.ddp:
+            assert torch.cuda.is_available()
+            init_process_group(backend="nccl")
+            self.ddp_rank = int(os.environ.get("RANK"))
+            self.ddp_local_rank = int(os.environ.get("LOCAL_RANK"))
+            self.ddp_world_size = int(os.environ.get("WORLD_SIZE"))
+            self.device = f"cuda:{self.ddp_local_rank}"
+            torch.cuda.set_device(self.device)
+            self.master_process = self.ddp_rank == 0  # This process will do logging, checkpointing, etc.
+        else:
+            self.ddp_rank = 0
+            self.ddp_local_rank = 0
+            self.ddp_world_size = 1
+            self.master_process = True
+            self.device = "cpu"
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            print(f"Using device: {self.device}")
 
     def stats_before_training(self) -> None:
         """Print some stats before starting training."""
@@ -56,6 +83,8 @@ class TrainingRun:
             data=data,
             block_size=self.gpt_config.block_size,
             batch_size=self.training_config.batch_size,
+            process_rank=self.ddp_rank,
+            num_processes=self.ddp_world_size,
         )
         self.max_steps = len(self.data_loader)
 
@@ -65,6 +94,8 @@ class TrainingRun:
         self.model = GPT(self.gpt_config)
         self.model.to(self.device)
         self.model = torch.compile(self.model) # Use torch.compile to optimize the model for faster training
+        self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
+        self.raw_model = self.model.module if self.ddp else self.model
         print(
             f"[bold blue]Model initialized with {sum(p.numel() for p in self.model.parameters())} parameters[/bold blue]"
         )
@@ -110,9 +141,10 @@ class TrainingRun:
 
     def grad_accumulation_setup(self) -> None:
         B, T = self.training_config.batch_size, self.gpt_config.block_size
-        assert self.training_config.desired_batch_size % (B * T) == 0, "Desired batch size must be a multiple of the actual batch size for gradient accumulation to work properly."
-        self.grad_accumulation_steps = self.training_config.desired_batch_size // (B * T)
-        print(f"Using gradient accumulation with {self.grad_accumulation_steps} steps to achieve effective batch size of {self.training_config.desired_batch_size} tokens")
+        assert self.training_config.desired_batch_size % (B * T * self.ddp_world_size) == 0, "Desired batch size must be a multiple of the actual batch size for gradient accumulation to work properly."
+        self.grad_accumulation_steps = self.training_config.desired_batch_size // (B * T * self.ddp_world_size)
+        if self.master_process:
+            print(f"Using gradient accumulation with {self.grad_accumulation_steps} steps to achieve effective batch size of {self.training_config.desired_batch_size} tokens")
 
     def train(self) -> None:
         """Main training loop."""
@@ -136,7 +168,16 @@ class TrainingRun:
                     loss_accum += loss.detach()  # Detach single micro batch loss tensor from the computation graph and accumulate it for logging purposes, so we can log the average loss over the gradient accumulation steps without affecting the gradients
                     # TODO: Doesnt detaching the loss here cause any issues with backpropagation? We still want to backpropagate through the loss to update the model parameters, but we also want to accumulate the loss for logging purposes.
                     # By detaching the loss, we can accumulate it without affecting the gradients, which should be fine as long as we are still backpropagating through the original loss tensor that is not detached.
+                    
+                    # We do not want to do 'all-reduce' and grad sync at every single micro step, instead accumulate them and sync them at final micro step
+                    if self.ddp:
+                        self.model.require_backward_grad_sync = (micro_step == self.grad_accumulation_steps - 1)
                     loss.backward()
+                
+                # Get accurate synced accumulated loss
+                if self.ddp:
+                    torch.distributed.all_reduce(loss_accum, op=torch.distributed.ReduceOp.AVG)
+
                 # Do gradient norm clipping to prevent exploding gradients, which can be more likely with mixed precision training or just bad data batch
                 # grad_norm = sum(p.grad.data.item() ** 2 for p in self.model.parameters()) ** (1. / 2) - TODO: check if this is correct way to compute grad norm
                 # Make sure this grad_norm is not too large, otherwise it can cause instability in training. We can clip the gradients to a maximum norm value to prevent this.
@@ -152,17 +193,22 @@ class TrainingRun:
                 torch.cuda.synchronize() # Ensure all GPU operations are complete before measuring time
                 t1 = time.time()
                 dt = (t1 - t0) * 1000 # Convert to milliseconds
-                tokens_per_second = self.training_config.batch_size * self.gpt_config.block_size * self.grad_accumulation_steps / (t1 - t0)
+                tokens_per_second = self.training_config.batch_size * self.gpt_config.block_size * self.grad_accumulation_steps * self.ddp_world_size / (t1 - t0)
                 tps_list.append(tokens_per_second)
-                pbar.update(1)
-                pbar.set_postfix(loss=loss.item())
-                pbar.set_description(f"Step {step} | Time {dt:.2f} ms | TPS {tokens_per_second:.2f} | Loss: {loss_accum.item():.4f} | Grad Norm: {norm:.4f} | LR: {lr:.2e}")
+                if self.master_process:
+                    pbar.update(1)
+                    pbar.set_postfix(loss=loss.item())
+                    pbar.set_description(f"Step {step} | Time {dt:.2f} ms | TPS {tokens_per_second:.2f} | Loss: {loss_accum.item():.4f} | Grad Norm: {norm:.4f} | LR: {lr:.2e}")
         end = time.time()
-        print(f"[bold green]Final loss after training: {losses[-1]:.4f}[/bold green]")
-        print(f"[bold green]Training time: {end - start:.2f} seconds[/bold green]")
-        print(f"[bold green]Average time per step: {(end - start) / len(self.data_loader) * 1000:.2f} ms[/bold green]")
-        print(f"[bold green]Total tokens processed: {self.max_steps * self.training_config.batch_size * self.gpt_config.block_size * self.grad_accumulation_steps}[/bold green]")
-        print(f"[bold green]Average Throughput (Tokens per second): {np.mean(tps_list):.2f}[/bold green]")
+        if self.master_process:
+            print(f"[bold green]Final loss after training: {losses[-1]:.4f}[/bold green]")
+            print(f"[bold green]Training time: {end - start:.2f} seconds[/bold green]")
+            print(f"[bold green]Average time per step: {(end - start) / len(self.data_loader) * 1000:.2f} ms[/bold green]")
+            print(f"[bold green]Total tokens processed: {self.max_steps * self.training_config.batch_size * self.gpt_config.block_size * self.grad_accumulation_steps * self.ddp_world_size}[/bold green]")
+            print(f"[bold green]Average Throughput (Tokens per second): {np.mean(tps_list):.2f}[/bold green]")
+        
+        if self.ddp:
+            destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -243,3 +289,9 @@ if __name__ == "__main__":
 # E.g. increase vocab to 50,304 (instead of 50,207) to make it a multiple of 256, which is a common block size for GPU processing. This can help to improve the efficiency of the model and speed up training.
 # Even though we are doing more (& redundant) computation & waste additional memory with a larger vocab size, the overall training time can still be reduced due to better GPU utilization and faster processing of the data.
 # This is a common trade-off in deep learning where we may do more computation but achieve faster training times due to better hardware utilization.
+
+
+# 5. DDP
+# Launch num GPU processes, for ecah process runs similarly but runs on different parts of the data
+# Once they all calculate the grads, they do avg of grads
+# Each process has an identical copy of the model

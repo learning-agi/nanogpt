@@ -13,3 +13,4 @@
 | BF16                         | Compile                 | 263.20ms (compilation time > 30 secs)          | 105,520.53 | 23.8GB       |
 | BF16                         | Prev + FlashAttention   | 197.49ms                                       | 143,213.67 | 14.7GB       |
 | BF16                         | Prev + All powers of 2  | 194.74ms                                       | 147,669.85 | 13.8GB       |
+| BF16                         | Prev + DDP              | 2438.89m                                       | 291,865.23 | 13.8GB       |
